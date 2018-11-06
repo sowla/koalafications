@@ -1,0 +1,575 @@
+---
+title: "Data wrangling"
+output:
+  html_document:
+    highlight: tango
+---
+
+```{r max_height_example, include=FALSE}
+library(knitrhooks)
+output_max_height()
+```
+
+In this script, I'm practising my SQL and R ({tidyverse}, {data.table} and base) skills using the SQL query exercises samples from <a href="https://datamasked.com/" target="_blank">"A collection of data science take-home challenges"</a>. You can find the rendered HTML file <a href="https://sowla.github.io/koalafications/data_wrangling.html" target="_blank">here</a>.
+
+Skip to: [example 1](#example-1-original-question), [example 2](#example-2-original-question), [example 3](#example-3-original-question).
+
+Note: I'm using SQLite via R in an Rmarkdown script (RStudio version 1.1.423). Some functions, eg. `row_number()` (available in SQLite 3.25.0), are therefore not available.
+
+<hr />
+
+## Example 1 (<a href="https://datamasked.com/wp-content/uploads/2017/12/query1.html" target="_blank">original question</a>) {.tabset}
+
+"For each user_id, find the difference between the last action and the second last action. Action here is defined as visiting a page. If the user has just one action, you can either remove her from the final results or keep that user_id and have NULL as time difference between the two actions."
+
+Information about the data:
+
+```{r echo=FALSE}
+data.frame(stringsAsFactors=FALSE,
+  Column.Name = c("user_id", "page", "unix_timestamp"),
+  Value = c("6684", "home_page", "1451640067"),
+  Description = c("this is id of the user", "the page visited",
+    "unix timestamp in seconds")
+)
+```
+
+<br />
+
+**Generate dummy data to work on:**
+```{r}
+set.seed(1000)
+ex1_df <- data.frame(
+  user_id = sample(letters[1:3], 6, replace = TRUE),
+  page = sample(c("home_page", "about", "details", "booking"), 6, replace = TRUE),
+  unix_timestamp = sample(1451640000:1451641000, 6),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r}
+ex1_df
+```
+**Expected results:** I'll remove user "b" (who has one action) and I'm expecting the difference in time between the "home_page" and "booking" pages for user "a" (`r ex1_df[3, 3] - ex1_df[6, 3]`s) and the difference in time between the "details" and "about" pages for user "c" (`r ex1_df[2, 3] - ex1_df[4, 3]`s).
+
+<br />
+
+### R {tidyverse} approach
+
+I'm a big fan of {tidyverse}, and it's generally my go-to approach to data wrangling.
+
+```{r message=FALSE}
+library(dplyr)
+```
+
+```{r}
+ex1_df %>%
+  group_by(user_id) %>%
+  
+  # get and label the last two actions for each user
+  arrange(desc(unix_timestamp), .by_group = TRUE) %>%
+  filter(row_number() <= 2) %>%
+  mutate(rank = case_when(
+    length(min_rank(unix_timestamp)) == 1 ~ "only",
+    min_rank(unix_timestamp) == 1 ~ "second_last",
+    min_rank(unix_timestamp) == 2 ~ "last"
+  )) %>%
+  
+  # reshape data and calculate time differences
+  select(-page) %>%
+  tidyr::spread(rank, unix_timestamp) %>%
+  mutate(time_diff = last - second_last) %>% ##TODO: use transmute??
+  
+  # remove irrelvant columns and rows
+  filter(!is.na(time_diff)) %>%  # remove this step to keep NAs
+  select(user_id, time_diff)
+
+```
+
+<br />
+
+### R {data.table} approach
+
+I don't regularly use {data.table}, but it's performant even when dealing with <a href="https://h2oai.github.io/db-benchmark/" target="_blank">50 GB of data (1,000,000,000 rows x 9 columns)</a>, which is great!
+
+```{r message=FALSE}
+library(data.table)
+```
+
+```{r}
+ex1_DT <- as.data.table(ex1_df)
+
+get_time_diff <- function(timestamp) {
+  two_times <- head(timestamp, 2)
+  return(two_times[1] - two_times[2])
+}
+
+ex1_DT[
+  order(-unix_timestamp), 
+  lapply(.SD, get_time_diff), 
+  keyby = .(user_id), 
+  .SDcols = c("unix_timestamp")
+  ][unix_timestamp > 0,  # remove this step to keep NAs
+    .(user_id, time_diff = unix_timestamp)
+    ][order(user_id)]
+```
+
+<br />
+
+### Base R approach
+
+Even though I think {tidyverse} and {data.table} are great, I think it's good to make sure I can still analyse data without them..
+
+```{r}
+# get the time difference for the last two actions
+temp_df <- ex1_df[order(ex1_df$unix_timestamp, decreasing = TRUE), ]
+
+summ_df <- aggregate(
+  temp_df$unix_timestamp, 
+  by = list(user_id = temp_df$user_id), 
+  FUN = get_time_diff  # defined in data.table approach
+)
+
+# clean up
+summ_df <- summ_df[!is.na(summ_df["x"]), ]    # remove this step to keep NAs
+names(summ_df) <- c("user_id", "time_diff")
+summ_df
+```
+
+<br />
+
+### SQL/mixed approach
+
+This whole script started because I'm new to SQL and want to practice! I didn't want to install a SQL database on my computer, so I'm using R to establish connection to a temporary database.
+
+```{r}
+library(DBI)
+con <- dbConnect(RSQLite::SQLite(), "")
+```
+
+I could create table with SQL...
+```{sql connection = con}
+CREATE TABLE small_table (
+  user_id varchar(255),
+  page varchar(255),
+  unix_timestamp int
+)
+```
+
+```{sql connection = con}
+INSERT INTO small_table (user_id, page, unix_timestamp)
+VALUES ("a", "home_page", 1451640067), ("b", "home_page", 1451640067), ("c", "home_page", 1451640067)
+```
+
+```{sql, connection = con, output.var = "sm_tbl"}
+SELECT *
+FROM small_table
+```
+
+```{r echo = FALSE}
+sm_tbl
+```
+
+... but this is quite tedious, so I'll just use the dummy data frame I made earlier
+```{r}
+dbWriteTable(con, "ex1_df", ex1_df)
+```
+
+```{sql, connection = con, output.var = "eg"}
+SELECT *
+FROM ex1_df
+```
+
+```{r echo=FALSE}
+eg
+```
+
+**SQL query**
+```{sql, connection = con, output.var = "ex1_res"}
+-- calculate time differences
+SELECT user_id, max_time - sec_max_time AS diff_time
+FROM (
+  SELECT one.user_id, one.max_time AS max_time, two.unix_timestamp AS sec_max_time
+  FROM (
+  
+    -- get time for last action
+    SELECT user_id, MAX(unix_timestamp) AS max_time
+    FROM ex1_df
+    GROUP BY user_id
+  ) AS one
+
+  -- get time for second last action
+  INNER JOIN ex1_df AS two  -- change INNER JOIN to OUTER JOIN to keep NULLs
+  USING(user_id)
+  WHERE sec_max_time < max_time
+  GROUP BY one.user_id
+)
+```
+
+```{r echo = FALSE}
+ex1_res
+```
+
+
+
+<hr />
+
+## Example 2 (<a href="https://datamasked.com/wp-content/uploads/2017/12/query3.html" target="_blank">original question</a>) {.tabset}
+
+"We define as power users those users who bought at least 10 products. Write a query that returns for each user on which day they became a power user. That is, for each user, on which day they bought the 10th item."
+
+Information about the data:
+
+```{r echo=FALSE}
+data.frame(stringsAsFactors=FALSE,
+  Column.Name = c("user_id", "date"),
+  Value = c("675", "2014-12-31 16:16:12"),
+  Description = c("this is id of the user",
+    "user 675 bought something on Dec 31, 2014 at 4:16:12 PM")
+)
+```
+
+<br />
+
+**Generate dummy data to work on:**
+
+```{r}
+set.seed(1000)
+some_dates <- as.Date("2014-10-01")-1:360
+some_times <- paste(10:24,10:60,10:60, sep = ":")
+ex2_df <- data.frame(
+  user_id = sample(letters[1:3], 50, replace = TRUE),
+  date = sample(paste(some_dates, some_times), 50),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r output_max_height = "300px"}
+ex2_df  # note: output in HTML file is scrollable
+```
+
+```{r output_max_height = "300px"}
+# make sure there are at least 10 entries
+sapply(letters[1:3], function(x) sum(ex2_df$user_id == x))
+
+ex2_df <- ex2_df[order(ex2_df$date), ]
+
+lapply(letters[1:3], function(x) head(ex2_df[ex2_df$user_id == x,], 10))   # HTML scrollable
+```
+
+**Expected results:** I'm expecting "2014-04-27" for user "a", "2014-05-08" for user "b" and "2014-07-09" for user "c".
+
+<br />
+
+### R {tidyverse} approach
+
+```{r}
+ex2_df %>%
+  group_by(user_id) %>%
+  arrange(date, .by_group = TRUE) %>%
+  filter(row_number() == 10) %>%
+  mutate(date = stringr::str_remove(date, "[:space:].+"))
+```
+
+<br />
+
+### R {data.table} approach
+
+```{r}
+ex2_DT <- as.data.table(ex2_df)
+
+get_nth_date <- function(date_time, n) {
+  return(sub("\\s.+", "", date_time[n]))
+}
+
+ex2_DT[
+  order(date), 
+  lapply(.SD, get_nth_date, 10), 
+  keyby = .(user_id), 
+  .SDcols = c("date")
+  ]
+```
+
+<br />
+
+### Base R approach
+
+```{r}
+temp_df <- ex2_df[order(ex2_df$date), ]
+
+summ_df <- aggregate(
+  temp_df$date, 
+  by = list(user_id = temp_df$user_id), 
+  FUN = get_nth_date, n = 10    # defined in data.table approach
+)
+
+names(summ_df) <- c("user_id", "date")
+summ_df
+```
+
+<br />
+
+### SQL/mixed approach
+
+```{r}
+dbWriteTable(con, "ex2_df", ex2_df)
+```
+
+**SQL query**
+```{sql, connection = con, output.var = "ex2_res"}
+SELECT t3.user_id, t3.date
+FROM (
+  SELECT (
+    SELECT COUNT(*)
+    FROM ex2_df AS t2
+    WHERE t1.date > t2.date AND t1.user_id = t2.user_id) AS rowNum,
+    user_id,
+    substr(date, 1, 10
+  ) AS date
+  FROM ex2_df t1
+  ORDER BY t1.user_id ASC
+) AS t3
+  WHERE t3.rowNum = 9
+```
+
+```{r echo=FALSE}
+ex2_res
+```
+
+<hr />
+
+## Example 3 (<a href="https://datamasked.com/wp-content/uploads/2017/12/query6.html" target="_blank">original question</a>) {.tabset}
+
+"We have a table with users, their country and when they created the account. We want to find:
+
+- The country* with the largest and smallest number of users
+- A query that returns for each country the first and the last user who signed up (if that country has just one user, it should just return that single user)"
+
+\* I'm assuming "countries"
+
+Information about the data:
+
+```{r echo=FALSE}
+data.frame(stringsAsFactors=FALSE,
+  Column.Name = c("user_id", "created_at", "country"),
+  Value = c("2", "2015-02-28 16:00:40", "China"),
+  Description = c("this is id of the user",
+    "user 2 created her account on Feb, 2 around 4PM",
+    "She is based in China")
+)
+```
+
+**Generate dummy data to work on:**
+```{r}
+set.seed(1000)
+ex3_df <- data.frame(
+  user_id = sample(1:10, 10),
+  created_at = sample(paste(some_dates, some_times), 10),  # variables from ex2_df
+  country = c(
+    sample(c("country_a", "country_b", "country_c"), 8, replace = TRUE),
+    "country_d", "country_e"  # to make sure there are countries with one user
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r}
+ex3_df
+```
+
+**Expected results:**
+- I'm expecting "country_a" and "country_c" to have 3 users each, while "country_d" and "country_e" should have one user each.
+- It makes most sense to me to return a table with the countries in one column and three columns with the id of the "first", "last" or "only" users, or NA/NULL if not applicable, ie:  
+
+| country | first | last | only |
+|---------|-------|------|------|
+|country_a|     5 |    1 |   NA |
+|country_b|    10 |    3 |   NA |
+|country_c|     7 |    8 |   NA |
+|country_d|    NA |   NA |    9 |
+|country_e|    NA |   NA |    6 |
+
+<br />
+
+### R {tidyverse} approach
+
+part 1
+```{r}
+ex3_df %>%
+  group_by(country) %>%
+  summarise(user_num = n()) %>%
+  filter(user_num == min(user_num) | user_num == max(user_num))  # shows all if tied
+```
+
+part 2
+```{r}
+ex3_df %>%
+  group_by(country) %>%
+  mutate(rank = min_rank(created_at)) %>%
+  mutate(user_order =
+      case_when(
+        length(min_rank(created_at)) == 1 ~ "only",
+        rank == min(min_rank(created_at)) ~ "first",
+        rank == max(min_rank(created_at)) ~ "last"
+      )
+  ) %>%
+  filter(user_order %in% c("first", "last", "only")) %>%
+  select(-created_at, -rank) %>%
+  tidyr::spread(user_order, user_id)
+```
+
+<br />
+
+### R {data.table} approach
+
+part 1
+```{r}
+ex3_DT <- as.data.table(ex3_df)
+
+ex3_DT[, 
+  lapply(.SD, length), 
+  keyby = .(country), 
+  .SDcols = c("user_id")
+  ][, .(country, user_num = user_id)
+    ][user_num == min(user_num) | user_num == max(user_num)]
+```
+
+part 2
+```{r}
+add_only <- function(x) {
+  
+  head_x <- head(x, 1)
+  
+  ifelse(head_x == tail(x, 1), head_x, NA)
+}
+
+ex3_DT[
+  order(created_at), 
+  .(first = lapply(.SD, head, 1),  # this part probably pretty inefficient..?
+    last = lapply(.SD, tail, 1),
+    only = lapply(.SD, add_only)),
+  keyby = .(country), 
+  .SDcols = c("user_id")
+  ][, .(
+    country,
+    first = ifelse(is.na(only), first, NA), 
+    last = ifelse(is.na(only), last, NA), 
+    only
+  )
+    ]
+```
+
+<br />
+
+### Base R approach
+
+part 1
+```{r}
+summ_df <-
+  aggregate(ex3_df$country, by = list(country = ex3_df$country), FUN = length)
+names(summ_df) <- c("country", "user_num")
+
+max_num <- summ_df$user_num == max(summ_df$user_num)
+min_num <- summ_df$user_num == min(summ_df$user_num)
+
+summ_df[max_num | min_num, ]
+```
+
+part 2
+```{r}
+temp_ex3_df <- ex3_df[order(ex3_df$created_at), ]
+s_ex3_df <- split(temp_ex3_df, temp_ex3_df$country)
+
+add_user_order <- function(df) {
+  if(nrow(df) == 1) c(NA, NA, df[1,1])
+  else if(nrow(df) == 2) c(df[1,1], df[2,1], NA)
+  else if(nrow(df) > 2) c(df[1,1], df[nrow(df),1], NA)
+}
+
+summ_df <- as.data.frame(lapply(s_ex3_df, add_user_order))  # list to data frame
+summ_df <- as.data.frame(t(summ_df))  # again since t() converts to matrix
+names(summ_df) <- c("first", "last", "only")
+
+summ_df
+```
+
+<br />
+
+### SQL/mixed approach
+
+```{r}
+dbWriteTable(con, "ex3_df", ex3_df)
+```
+
+SQL part
+```{sql, connection = con, output.var = "ex3_res1"}
+SELECT country, COUNT(user_id) AS num_users
+FROM ex3_df
+GROUP BY country
+HAVING num_users = (
+  SELECT max(num_users)
+  FROM (
+  SELECT COUNT(user_id) AS num_users, country
+  FROM ex3_df
+  GROUP BY country
+  )
+) OR num_users = (
+  SELECT min(num_users)
+  FROM (
+  SELECT COUNT(user_id) AS num_users, country
+  FROM ex3_df
+  GROUP BY country
+  )
+)
+-- works, but pretty inefficient.. maybe create a new table with INTO? 
+```
+
+```{r echo = FALSE}
+ex3_res1
+```
+
+```{sql, connection = con, output.var = "ex3_res2"}
+SELECT main.country, main.first_users, main.last_users, only_ut.user_id AS only
+FROM (
+  SELECT 
+  first_ut.country, 
+  first_ut.user_id AS first_users, 
+  last_ut.user_id AS last_users
+  FROM (
+    SELECT min(created_at), country, user_id  -- select first users
+    FROM ex3_df
+    GROUP BY country
+    ORDER BY created_at DESC
+  ) AS first_ut
+  INNER JOIN (
+    SELECT max(created_at), country, user_id  -- select last users
+    FROM ex3_df
+    GROUP BY country
+    ORDER BY created_at DESC
+  ) AS last_ut
+  USING(country)
+) AS main
+  LEFT JOIN (
+    SELECT country, user_id  -- select only users
+    FROM ex3_df
+    GROUP BY country
+    HAVING Count(created_at) = 1
+  ) AS only_ut
+  USING(country)
+```
+
+```{r echo = FALSE}
+ex3_res2
+```
+
+Note: in this query, I'm using `LEFT JOIN` since `OUTER JOIN`s not currently supported; using an `OUTER JOIN` would give "NA"s for "country_d" and "country_e" in "first_users" and "last_users" columns.
+
+<hr />
+
+Done!
+```{r}
+DBI::dbDisconnect(con)
+```
+
+## notes:  
+- this is the first time I've written SQL code that's flavour-dependent.. searching for answers was definitely different!  
+- I was least familiar with writing {data.table} code, but the [documentation](https://cran.r-project.org/web/packages/data.table/vignettes/datatable-intro.html) is great! I ran some of the benchmarking code on my laptop on a "small" data frame with "only" a million rows and there's a notable difference between {dplyr} and {data.table}. I'm looking forward to getting to know this package!
